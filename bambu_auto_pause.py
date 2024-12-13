@@ -3,9 +3,14 @@
 import re
 import os
 import sys
+import json
 import shutil
 import hashlib
 import tempfile
+import itertools
+from collections.abc import Iterator
+from typing import TypeVar
+from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZipFile, ZIP_STORED, ZipInfo
 
@@ -120,153 +125,332 @@ class UpdateableZipFile(ZipFile):
 
 pause_gcode = """M400 U1"""
 
-def insert_necessary_pauses(gcode: list[str], remap: dict[int, int], filament_changes_file: Path, slots: list[int] = [1, 2, 3, 4]) -> list[str]:
-    # The gcode colors are 0-indexed, the bambu studio colors are 1-indexed
-    #
-    # For ease of use, the argument is 1-indexed and converted to 0-indexed here.
+T = TypeVar('T')
+def unique_k_partition(collection: list[T], k: int, max_group_size: int | None = None) -> Iterator[list[list[T]]]:
+    if len(collection) == 1 and k == 1:
+        yield [ collection ]
+        return
+    elif len(collection) == 1:
+        return
 
-    # The remap dictionary defines which color should be remapped to which slot.
-    # For example, given the remap { 5 : 2 }, it will assume that color 5 shares
-    # the AMS slot with color 2.
-    remap = {k - 1: v - 1 for k, v in remap.items()}
-    if len(remap) == 0:
-        print("Warning: No remapping necessary, gcode will be left unchanged.")
-        return gcode
+    first = collection[0]
+    for smaller in unique_k_partition(collection[1:], k, max_group_size=max_group_size):
+        # insert `first` in each of the subpartition's subsets
+        for n, subset in enumerate(smaller):
+            # only build partitions where the group size is less than or equal to max_group_size
+            if max_group_size is not None and len(subset) + 1 > max_group_size:
+                continue 
 
-    # The slots list defines which colors are currently in which AMS slot.
-    # The code will update this list as it encounters new colors.
-    slots = [s - 1 for s in slots]
+            yield smaller[:n] + [[first] + subset] + smaller[n + 1:]
 
-    # Add the default colors to the remap dictionary:
-    for i, slot in enumerate(slots):
-        remap[slot] = i
+    for smaller in unique_k_partition(collection[1:], k - 1, max_group_size=max_group_size):
+        # put `first` in its own subset
+        yield [[first]] + smaller
 
-    result = []
-    toolchange_count = 0
-    manual_toolchange_count = 0
-    current_slot = None
-    current_layer = 0
-    toolchange_conflicts = {}
-    output = []
+class Filament:
+    id: int
+    color: str
 
-    for i, line in enumerate(gcode):
-        # This gcode is used to indicate the start of a new layer.
-        # It is kept track of to provide context for where tool changes
-        # are problematic.
-        match = re.match(r'M73 L(\d+)', line)
-        if match:
-            current_layer = int(match.group(1))
-            result.append(line)
-            continue
+    def __init__(self, id: int, color: str) -> None:
+        self.id = id
+        self.color = color
+    
+    def __str__(self) -> str:
+        return f"{self.id + 1}"
+    
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Filament):
+            return self.id == other.id
+        return NotImplemented
 
-        # The T\d+ gcode indicates a tool change.
-        # For bambulab printers, this will be retracting the current filament
-        # and loading the next one.
+    def __hash__(self) -> int:
+        return hash(self.id)
+
+    def __repr__(self) -> str:
+        return str(self)
+
+class FilamentGrouping:
+    _groups: list[list[Filament]]
+
+    def __init__(self, groups: list[list[Filament]]) -> None:
+        seen = set()
+        duplicates = set()
+        for filament in [x for group in groups for x in group]:
+            if filament in seen:
+                duplicates.add(filament)
+            seen.add(filament)
+        
+        if len(duplicates) > 0:
+            raise ValueError(f"The filaments {list(duplicates)} are in multiple groups.")
+
+        self._groups = sorted([sorted(list(group), key=lambda x: x.id) for group in groups], key=len)
+
+    @staticmethod
+    def from_list(groups: list[list[int]], all_filaments: dict[int, Filament]) -> 'FilamentGrouping':
+        base = [[all_filaments[i] for i in group] for group in groups]
+
+        # now create single filament groups for all filaments that are not in any group
+        used_filaments = set([f for group in base for f in group])
+
+        base.extend([[f] for f in all_filaments.values() if f not in used_filaments])
+
+        return FilamentGrouping(base)
+
+    def is_grouped(self, left: Filament, right: Filament) -> bool:
+        for group in self._groups:
+            if left in group and right in group:
+                return True
+
+        return False
+    
+    def find_filament_group(self, filament: Filament) -> list[Filament] | None:
+        return next((group for group in self._groups if filament in group), None)
+    
+    def find_index(self, filaments: list[Filament], filament: Filament) -> int | None:
+        filament_group = self.find_filament_group(filament)
+        if filament_group is None:
+            raise ValueError(f"Filament {filament} is not in any group.")
+
+        for idx, current_filament in enumerate(filaments):
+            if current_filament in filament_group:
+                return idx
+
+        return None
+    
+    def __str__(self) -> str:
+        return ' '.join([':'.join([str(i) for i in g]) for g in self._groups])
+
+@dataclass
+class ToolChange:
+    # The layer number where the tool change occurs
+    layer: int
+    # The id of the current filament
+    current_filament: Filament | None
+    # The id of the next filament
+    next_filament: Filament
+    # The index of the tool change in the gcode
+    index: int
+
+    @staticmethod
+    def iter_from_gcode(gcode: list[str], colors: dict[int, str]) -> Iterator['ToolChange']:
+        current_filament = None
+        current_layer = 0
+
+        for idx, line in enumerate(gcode):
+            # This gcode is used to indicate the start of a new layer.
+            # It is kept track of to provide context for where tool changes
+            # are problematic.
+            match = re.match(r'M73 L(\d+)', line)
+            if match:
+                current_layer = int(match.group(1))
+                continue
+
+            # The T\d+ gcode indicates a tool change.
+            # For bambulab printers, this will be retracting the current filament
+            # and loading the next one.
+            #
+            # The script will insert a pause before the tool change if the next color
+            # is a color that is not currently in the AMS (slots list).
+            #
+            # Note: There seem to be two special tool changes in the gcode:
+            # - T1000
+            # - T255
+            # These will be ignored by the script.
+            match = re.match(r'T(\d+)', line)
+            if not match or match.group(1) in ['1000', '255']:
+                continue
+
+            next_filament_id = int(match.group(1))
+            next_filament = Filament(next_filament_id, colors[next_filament_id])
+
+            yield ToolChange(current_layer, current_filament, next_filament, idx)
+
+            current_filament = next_filament
+
+    def is_manual(self, ams: list[Filament], filament_grouping: FilamentGrouping) -> bool:
+        # A manual tool change is required if the next filament is not in the AMS and there is another
+        # filament of the same group as the next one in the ams.
+        return self.next_filament not in ams and filament_grouping.find_index(ams, self.next_filament) is not None
+
+    def is_conflict(self, filament_grouping: FilamentGrouping) -> bool:
+        # Assuming that slot 1 is currently printing,
+        # and it wants to switch to slot 5 which is grouped with slot 1,
+        # then we have a problem.
         #
-        # The script will insert a pause before the tool change if the next color
-        # is a color that is not currently in the AMS (slots list).
+        # The pause will be inserted before the tool change, but to swap the filament,
+        # the printer would have to unload the current filament first.
+        # I don't know how to just unload the filament without loading the next one
+        # (which would be what the T gcode does).
         #
-        # Note: There seem to be two special tool changes in the gcode:
-        # - T1000
-        # - T255
-        # These will be ignored by the script.
-        match = re.match(r'T(\d+)', line)
-        if not match or match.group(1) in ['1000', '255']:
-            result.append(line)
-            continue
+        # This problem can be solved by manually specifying the color change order.
+        if self.current_filament is None:
+            return False
 
-        next_slot = int(match.group(1))
-        toolchange_count += 1
+        return filament_grouping.is_grouped(self.current_filament, self.next_filament)
 
-        # The first tool change will be the initial loading of the filament.
-        # This will not be a color change, so it is ignored.
-        if current_slot is None:
-            if next_slot not in slots:
-                raise ValueError(f'gcode starts with a color {next_slot} that is not in the AMS: {slots}')
 
-            current_slot = next_slot
-            result.append(line)
-            continue
+@dataclass
+class ManualToolChange:
+    toolchange: ToolChange
+    ams: list[Filament]
 
-        # Check if the next color is in the AMS, if not, we need to insert a pause
-        if next_slot not in slots:
-            message = f"Manual filament change required in layer {current_layer}: Swap color {slots[remap[next_slot]] + 1} with {next_slot + 1}: {[i + 1 for i in slots]}"
+class GCode:
+    file_path: Path
+    plate: int
+    gcode: list[str]
+    filament_changes_file: Path
+    plate_metadata: dict
+    ams_size: int
+    line_separator: str
+    toolchanges: list[ToolChange]
+
+    def __init__(
+        self,
+        file_path: Path,
+        filament_changes_file: Path,
+        plate: int = 1,
+        ams_size: int = 4,
+        line_separator: str = '\n',
+    ) -> None:
+        with ZipFile(file_path, 'r') as zf:
+            with zf.open(f'Metadata/plate_{plate}.gcode') as f:
+                data = f.read().decode('utf-8')
+                line_separator = '\n'
+                if '\r\n' in data:
+                    line_separator = '\r\n'
+            
+            with zf.open(f'Metadata/plate_{plate}.json') as f:
+                metadata = json.load(f)
+
+        self.file_path = file_path
+        self.plate = plate
+        self.gcode = data.splitlines()
+        self.filament_changes_file = filament_changes_file
+        self.plate_metadata = metadata
+        self.ams_size = ams_size
+        self.line_separator = line_separator
+        self.toolchanges = list(ToolChange.iter_from_gcode(self.gcode, dict(zip(self.plate_metadata['filament_ids'], self.plate_metadata['filament_colors']))))
+
+    def all_filaments(self) -> list[Filament]:
+        return [Filament(id, color) for id, color in zip(self.plate_metadata['filament_ids'], self.plate_metadata['filament_colors'])]
+    
+
+    def find_first_full_ams(self, filament_grouping: FilamentGrouping) -> list[Filament]:
+        last_ams = []
+        for toolchange in self.iter_manual_toolchanges(filament_grouping):
+            last_ams = toolchange.ams
+            if len(last_ams) == self.ams_size:
+                return last_ams
+
+        return last_ams
+
+
+    def iter_manual_toolchanges(self, filament_grouping: FilamentGrouping) -> Iterator[ManualToolChange]:
+        ams = []
+        for toolchange in self.toolchanges:
+            # If a tool change occurs, it will switch from the current filament to the next filament.
+            # This can either be done automatically or manually.
+            # An automatic tool change will only occur if the next filament is already in the AMS.
+            # If the next filament is not in the AMS, a manual tool change is required.
+
+            if toolchange.is_manual(ams, filament_grouping):
+                yield ManualToolChange(toolchange, list(ams))
+
+            # First find the index of the filament that will be switched to by the tool change or in case of a manual tool change,
+            # the index of a filament that is in the same group as the next filament and in the AMS.
+            next_filament_index = filament_grouping.find_index(ams, toolchange.next_filament)
+            if next_filament_index is None:
+                if len(ams) == self.ams_size:
+                    raise ValueError(f"Could not find the index of the next filament {toolchange.next_filament} in the AMS: {ams}")
+                
+                # The next filament is not in the AMS, but there is still space in the AMS.
+                # -> Add it to the AMS.
+                ams.append(toolchange.next_filament)
+            else:
+                # The next filament is in the AMS, so swap it with the filament that is currently at the index.
+                ams[next_filament_index] = toolchange.next_filament
+
+    def find_best_mapping(self, max_group_size: int | None = None) -> tuple[FilamentGrouping, int, int] | None:
+        all_filaments = self.all_filaments()
+
+        best_combination = None
+        best_manual_changes = None
+        for combination in unique_k_partition(all_filaments, self.ams_size, max_group_size=max_group_size):
+            filament_grouping = FilamentGrouping(combination)
+
+            number_of_manual_toolchanges = sum([1 for _ in self.iter_manual_toolchanges(filament_grouping)])
+            if best_manual_changes is None or (number_of_manual_toolchanges <= best_manual_changes):
+                best_combination = filament_grouping
+                best_manual_changes = number_of_manual_toolchanges
+
+        if best_combination is None or best_manual_changes is None:
+            return None
+
+        return (best_combination, best_manual_changes, len(self.toolchanges))
+
+    def list_conflicts(self, filament_grouping: FilamentGrouping, iter_manual_changes: Iterator[ManualToolChange]) -> dict[int, list[ToolChange]]:
+        result = {}
+        for manual_toolchange in iter_manual_changes:
+            toolchange = manual_toolchange.toolchange
+            if toolchange.is_conflict(filament_grouping):
+                if toolchange.layer not in result:
+                    result[toolchange.layer] = []
+
+                result[toolchange.layer].append(toolchange)
+
+        return result
+
+    def write(self, modified_file: Path, filament_grouping: FilamentGrouping, log_file: Path) -> None:
+        # prepare the modified file:
+        data = []
+        output = []
+        # sorts the toolchanges by their index in the gcode
+        manual_toolchanges = list(i for i in sorted(self.iter_manual_toolchanges(filament_grouping), key=lambda x: x.toolchange.index))
+        iter_manual_toolchanges = iter(manual_toolchanges)
+        manual_toolchange = next(iter_manual_toolchanges, None)
+        for idx, line in enumerate(self.gcode):
+            # skip all lines until the next manual tool change
+            if manual_toolchange is None or idx != manual_toolchange.toolchange.index:
+                data.append(line)
+                continue
+
+            data.append(pause_gcode)
+            data.append(line)
+
+            (current_toolchange, current_state) = (manual_toolchange.toolchange, manual_toolchange.ams)
+            colorswap_index = filament_grouping.find_index(current_state, current_toolchange.next_filament)
+            if colorswap_index is None:
+                raise ValueError(f"Could not find the index for manual tool change: {current_toolchange} in the AMS: {current_state}")
+
+            color_to_swap_with = current_state[colorswap_index]
+            
+            message = f"Manual filament change required in layer {current_toolchange.layer}: Swap color {color_to_swap_with} with {current_toolchange.next_filament}: {current_state}"
             output.append(message)
             print(message)
-            result.append(pause_gcode)
-            manual_toolchange_count += 1
+            manual_toolchange = next(iter_manual_toolchanges, None)
 
-            # Assuming that slot 1 is currently printing,
-            # and it wants to switch to slot 5 which is remapped to slot 1,
-            # then we have a problem.
-            #
-            # The pause will be inserted before the tool change, but to swap the filament,
-            # the printer would have to unload the current filament first.
-            # I don't know how to just unload the filament without loading the next one
-            # (which would be what the T gcode does).
-            #
-            # This problem can be solved by manually specifying the color change order.
-            if remap[current_slot] == remap[next_slot] and current_slot != next_slot:
-                if current_layer not in toolchange_conflicts:
-                    toolchange_conflicts[current_layer] = []
+        print()
+        output.append("")
+        message = f"Filament change times: {len(self.toolchanges) - 1}"
+        print(message)
+        output.append(message)
+        message = f"Manual filament change times: {len(manual_toolchanges)}"
+        print(message)
+        output.append(message)
 
-                toolchange_conflicts[current_layer].append((current_slot, next_slot))
+        with open(log_file, 'w') as fd:
+            fd.write(self.line_separator.join(output))
 
-        current_slot = next_slot
-        slots[remap[next_slot]] = next_slot
+        if modified_file.exists():
+            modified_file.unlink()
 
-        result.append(line)
+        shutil.copy(self.file_path, modified_file)
+        with UpdateableZipFile(modified_file, 'a') as zf:
+            encoded_data = self.line_separator.join(data).encode('utf-8')
+            zf.writestr(f'Metadata/plate_{self.plate}.gcode', encoded_data)
+            zf.writestr(f'Metadata/plate_{self.plate}.gcode.md5', hashlib.md5(encoded_data).hexdigest().upper())
 
-    output.append("")
-    print("")
-    print(f"Filament change times: {toolchange_count - 1}")
-    print(f"Manual filament change times: {manual_toolchange_count}")
-
-    if len(toolchange_conflicts) > 0:
-        first_layer = None
-        last_layer = None
-        conflicts = []
-        print("")
-        print(f"The print order has to be changed in the slicer, so that the following colors are not printed after each other:")
-        for layer, v in toolchange_conflicts.items():
-            if first_layer is None or last_layer is None:
-                first_layer = layer
-                last_layer = layer
-                conflicts.extend(v)
-                continue
-
-            if all(c in conflicts for c in v) and layer <= last_layer + 1:
-                conflicts.extend(v)
-                last_layer = layer
-                continue
-
-            print(f"Layer {first_layer} to {last_layer}: {[f'{a+1} -> {b+1}' for (a, b) in set(conflicts)]}")
-            first_layer = layer
-            last_layer = layer + 1
-            conflicts = list(v)
-
-        if len(conflicts) > 0:
-            print(f"Layer {first_layer} to {last_layer}: {[f'{a+1} -> {b+1}' for (a, b) in set(conflicts)]}")
-
-        raise ValueError("Please fix the filament change order in the slicer.")
-
-    with open(filament_changes_file, 'w') as f:
-        f.write('\n'.join(output))
-
-    return result
-
-def read_gcode_file(file_path: Path, plate: int = 1) -> list[str]:
-    with ZipFile(file_path, 'r') as zf:
-        with zf.open(f'Metadata/plate_{plate}.gcode') as f:
-            return f.read().decode('utf-8').splitlines()
-
-def write_gcode_file(file_path: Path, data: list[str], plate: int = 1) -> None:
-    with UpdateableZipFile(file_path, 'a') as zf:
-        encoded_data = '\n'.join(data).encode('utf-8')
-        zf.writestr(f'Metadata/plate_{plate}.gcode', encoded_data)
-        zf.writestr(f'Metadata/plate_{plate}.gcode.md5', hashlib.md5(encoded_data).hexdigest().upper())
-
-if len(sys.argv) < 3:
+if len(sys.argv) < 2:
     print(f"Usage: {sys.argv[0]} <3mf gcode file> color:slot [color:slot ...]")
     print(f"For example: {sys.argv[0]} cube.gcode.3mf 5:2 7:3")
     sys.exit(1)
@@ -276,18 +460,74 @@ if not input_file.exists():
     print(f"Error: File {input_file} does not exist.")
     sys.exit(1)
 
-remap = {}
+grouped_filaments = []
 for arg in sys.argv[2:]:
-    color, slot = arg.split(':')
-    remap[int(color)] = int(slot)
+    grouped_filaments.append([int(i) - 1 for i in arg.split(':')])
 
-new_gcode = insert_necessary_pauses(read_gcode_file(input_file), remap, input_file.with_name(f"filament_changes.txt"))
+gcode = GCode(input_file, input_file.with_name(f"filament_changes.txt"))
+if len(grouped_filaments) == 0:
+    print("Warning: No color remapping specified. Will now compute the color remapping with the least amount of manual tool changes.")
+    mapping = gcode.find_best_mapping(2)
+    if mapping is None:
+        print("Error: Could not find a mapping.")
+        sys.exit(1)
+    
+    (grouped_filaments, manual_toolchanges, total_toolchanges) = mapping
+    print("")
+    print(f"Filament change times: {total_toolchanges - 1}")
+    print(f"Manual filament change times: {manual_toolchanges}")
 
-# copy the original file to the target file
-modified_file = input_file.with_name(f"{input_file.name.split('.')[0]}_with_pauses{''.join(input_file.suffixes)}")
-if modified_file.exists():
-    modified_file.unlink()
+    print(f"The best color remapping should be: {grouped_filaments}")
+else:
+    all_filaments = gcode.all_filaments()
+    grouped_filaments = FilamentGrouping.from_list(grouped_filaments, {f.id:f for f in all_filaments})
 
-shutil.copy(input_file, modified_file)
+states = list(gcode.iter_manual_toolchanges(grouped_filaments))
+if len(states) == 0:
+    print("No manual tool changes are required.")
+    sys.exit(0)
 
-write_gcode_file(modified_file, new_gcode)
+print(f"The program assumes that the AMS is loaded initially with the colors: {gcode.find_first_full_ams(grouped_filaments)}")
+print(f"The following filaments are grouped together: {grouped_filaments}")
+
+toolchange_conflicts = gcode.list_conflicts(grouped_filaments, states.__iter__())
+if len(toolchange_conflicts) > 0:
+    print(f"The print order has to be changed in the slicer, so that the following colors are not printed after each other:")
+
+first_layer = None
+last_layer = None
+conflicts = []
+
+def flatten(list: list[list[T]]) -> list[T]:
+    return [item for sublist in list for item in sublist]
+
+for (layer, tcs) in toolchange_conflicts.items():
+    v = [(tc.current_filament, tc.next_filament) for tc in tcs]
+    if first_layer is None or last_layer is None:
+        first_layer = layer
+        last_layer = layer
+        conflicts.extend(v)
+        continue
+
+    if all(c in conflicts for c in v) and layer <= last_layer + 1:
+        conflicts.extend(v)
+        last_layer = layer
+        continue
+
+    print(f"Layer {first_layer} to {last_layer}: {[f'{a} -> {b}' for (a, b) in set(conflicts)]}")
+    first_layer = layer
+    last_layer = layer + 1
+    conflicts = list(v)
+
+if len(conflicts) > 0:
+    print(f"Layer {first_layer} to {last_layer}: {[f'{a} -> {b}' for (a, b) in set(conflicts)]}")
+
+if len(toolchange_conflicts) > 0:
+    sys.exit(1)
+
+gcode.write(
+    input_file.with_name(f"{input_file.name.split('.')[0]}_with_pauses{''.join(input_file.suffixes)}"),
+    grouped_filaments,
+    input_file.with_name(f"filament_changes.txt")
+)
+
