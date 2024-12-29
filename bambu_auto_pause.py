@@ -7,7 +7,6 @@ import json
 import shutil
 import hashlib
 import tempfile
-import itertools
 from collections.abc import Iterator
 from typing import TypeVar
 from dataclasses import dataclass
@@ -124,6 +123,82 @@ class UpdateableZipFile(ZipFile):
             shutil.rmtree(tempdir)
 
 pause_gcode = """M400 U1"""
+
+# The default gcode that is used to change the filament in the printer, does not allow for pausing between
+# cutting the filament and loading the new filament.
+#
+# This prevents the user from manually changing the currently printing filament with a different one.
+# One can solve this by changing the filament print order in the slicer, but this is manual work, and might
+# result in extra filament changes.
+#
+# The solution is to insert a special filament change gcode for the problematic tool changes. This gcode will
+# first unload the filament (like what pressing the unload button in the app would do), then pauses the printer
+# and finally loads the new filament from the AMS.
+#
+# While implementing this, I found this reddit post, which describes the same solution:
+# https://www.reddit.com/r/BambuLab/comments/18y6thn/guide_printing_6_colors_on_one_ams_with_custom/
+def paused_filament_change(filament_change_gcode: list[str]) -> list[str]:
+    # sanity check that the input gcode contains everything expected
+    if not filament_change_gcode[0].startswith("; CP TOOLCHANGE START"):
+        raise ValueError("The filament change gcode does not start with the expected comment.")
+    if not filament_change_gcode[-1].startswith("; CP TOOLCHANGE END"):
+        raise ValueError("The filament change gcode does not end with the expected comment.")
+
+    result = []
+    next_extruder = None
+    for line in filament_change_gcode:
+        # replace the M620 S\dA command with the unload indicator
+        match = re.match(r'M620 S(\d+)A', line)
+        if match:
+            next_extruder = int(match.group(1))
+            result.append(f"M620 S255")
+            continue
+
+        # These lines are only used around the T gcode, which is used to change the filament.
+        # Before the T gcode, a few more things are inserted, so the M620.1 lines are skipped,
+        # and will be inserted after the pause gcode.
+        if line.startswith("M620.1 E F523 T240"):
+            continue
+
+        match = re.match(r'T(\d+)', line)
+        if match:
+            # Sanity check, should not happen.
+            if next_extruder is None:
+                raise ValueError("The next extruder was not set before the tool change?")
+
+            # Start the unload process (including the cutting of the filament)
+            result.append("T255")
+            # Indicate that the unload process is done? Not 100% sure what this gcode does.
+            result.append("M621 S255")
+
+            # Then pause the printer:
+            result.append(pause_gcode)
+
+            # At this point, the toolhead is in the poop chute.
+            # The pause gcode has moved the toolhead and the bed, which will be restored by pressing the resume button.
+            #
+            # The next step is to load the new filament from the AMS. The T gcode will move the toolhead to the cutter,
+            # then without cutting, it will move back to the chute. (It is redundant, but there seems to be no way to advoid it.)
+            #
+            # In a previous test, I did not have the following movements in the gcode, resulting in an awful noises while the
+            # toolhead was moving out of the poop chute. I would rather not buy a new poop chute, these movements will move the
+            # toolhead to a safe position before it initiates the filament loading.
+            result.append("G1 X100 F5000")
+            result.append("G1 X165 F15000")
+            result.append("G1 Y256")
+            # Wait for the movements to complete
+            result.append("M400")
+
+            # This inserts the original filament change gcodes, which will load the new filament from the AMS:
+            result.append(f"M620 S{next_extruder}A")
+            result.append("M620.1 E F523 T240")
+            result.append(line)
+            result.append("M620.1 E F523 T240")
+            continue
+
+        result.append(line)
+
+    return result
 
 T = TypeVar('T')
 def unique_k_partition(collection: list[T], k: int, max_group_size: int | None = None) -> Iterator[list[list[T]]]:
@@ -399,6 +474,18 @@ class GCode:
                 result[toolchange.layer].append(toolchange)
 
         return result
+    
+    def inform_user(self, manual_toolchange: ManualToolChange, filament_grouping: FilamentGrouping, output: list[str]) -> None:
+        (current_toolchange, current_state) = (manual_toolchange.toolchange, manual_toolchange.ams)
+        colorswap_index = filament_grouping.find_index(current_state, current_toolchange.next_filament)
+        if colorswap_index is None:
+            raise ValueError(f"Could not find the index for manual tool change: {current_toolchange} in the AMS: {current_state}")
+
+        color_to_swap_with = current_state[colorswap_index]
+
+        message = f"Manual filament change required in layer {current_toolchange.layer}: Swap color {color_to_swap_with} with {current_toolchange.next_filament}: {current_state}"
+        output.append(message)
+        print(message)
 
     def write(self, modified_file: Path, filament_grouping: FilamentGrouping, log_file: Path) -> None:
         # prepare the modified file:
@@ -408,7 +495,27 @@ class GCode:
         manual_toolchanges = list(i for i in sorted(self.iter_manual_toolchanges(filament_grouping), key=lambda x: x.toolchange.index))
         iter_manual_toolchanges = iter(manual_toolchanges)
         manual_toolchange = next(iter_manual_toolchanges, None)
+        skip_until = None
         for idx, line in enumerate(self.gcode):
+            if skip_until is not None:
+                if idx == skip_until:
+                    skip_until = None
+                continue
+
+            # This inserts the special filament change gcode for the problematic tool changes.
+            if manual_toolchange is not None and manual_toolchange.toolchange.is_conflict(filament_grouping) and line.startswith("; CP TOOLCHANGE START"):
+                end = next((idx for idx, line in enumerate(self.gcode[idx:], start=idx) if line.startswith("; CP TOOLCHANGE END")), None)
+                if end is None or not self.gcode[end].startswith("; CP TOOLCHANGE END"):
+                    raise ValueError("Could not find the end of the tool change gcode.")
+
+                data.extend(paused_filament_change(self.gcode[idx:end + 1]))
+                # ensure that all lines are skipped until the end of the tool change gcode (to prevent double insertions)
+                skip_until = end
+
+                self.inform_user(manual_toolchange, filament_grouping, output)
+                manual_toolchange = next(iter_manual_toolchanges, None)
+                continue
+
             # skip all lines until the next manual tool change
             if manual_toolchange is None or idx != manual_toolchange.toolchange.index:
                 data.append(line)
@@ -417,16 +524,7 @@ class GCode:
             data.append(pause_gcode)
             data.append(line)
 
-            (current_toolchange, current_state) = (manual_toolchange.toolchange, manual_toolchange.ams)
-            colorswap_index = filament_grouping.find_index(current_state, current_toolchange.next_filament)
-            if colorswap_index is None:
-                raise ValueError(f"Could not find the index for manual tool change: {current_toolchange} in the AMS: {current_state}")
-
-            color_to_swap_with = current_state[colorswap_index]
-            
-            message = f"Manual filament change required in layer {current_toolchange.layer}: Swap color {color_to_swap_with} with {current_toolchange.next_filament}: {current_state}"
-            output.append(message)
-            print(message)
+            self.inform_user(manual_toolchange, filament_grouping, output)
             manual_toolchange = next(iter_manual_toolchanges, None)
 
         print()
@@ -523,7 +621,16 @@ if len(conflicts) > 0:
     print(f"Layer {first_layer} to {last_layer}: {[f'{a} -> {b}' for (a, b) in set(conflicts)]}")
 
 if len(toolchange_conflicts) > 0:
-    sys.exit(1)
+    print("")
+    print("There are conflicts with the current filament printing order.")
+    print("You can change the filament order for these layers in the slicer and re-run the script.")
+    print("")
+    print("This script will now generate a special gcode file where it resolves these conflicts through a special filament change gcode.")
+    print("Therefore you don't have to change the filament order in the slicer.")
+    print("")
+    print("Warning: This script has only been tested on a P1S, it might break stuff on other printers like the A1 or A1 mini!")
+    print("         If you don't want to risk it, change the print order in the slicer.")
+    # sys.exit(1)
 
 gcode.write(
     input_file.with_name(f"{input_file.name.split('.')[0]}_with_pauses{''.join(input_file.suffixes)}"),
