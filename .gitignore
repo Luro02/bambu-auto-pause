@@ -2,6 +2,7 @@
 *.3mf
 *.gcode.3mf
 filament_changes.txt
+*.gcode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

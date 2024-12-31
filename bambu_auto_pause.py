@@ -303,15 +303,22 @@ class ToolChange:
     current_filament: Filament | None
     # The id of the next filament
     next_filament: Filament
-    # The index of the tool change in the gcode
+    # The index of the tool change in the gcode (T gcode)
     index: int
+    # The index of the gcode where the toolchange starts (; CP TOOLCHANGE START)
+    start_index: int | None
+    # The index of the gcode where the toolchange ends (; CP TOOLCHANGE END)
+    end_index: int
 
     @staticmethod
     def iter_from_gcode(gcode: list[str], colors: dict[int, str]) -> Iterator['ToolChange']:
         current_filament = None
         current_layer = 0
-
+        current_start_index = None
         for idx, line in enumerate(gcode):
+            if line.startswith("; CP TOOLCHANGE START"):
+                current_start_index = idx
+
             # This gcode is used to indicate the start of a new layer.
             # It is kept track of to provide context for where tool changes
             # are problematic.
@@ -338,7 +345,12 @@ class ToolChange:
             next_filament_id = int(match.group(1))
             next_filament = Filament(next_filament_id, colors[next_filament_id])
 
-            yield ToolChange(current_layer, current_filament, next_filament, idx)
+            end_index = next((idx for idx, line in enumerate(gcode[idx:], start=idx) if line.startswith("; CP TOOLCHANGE END")), None)
+
+            if end_index is None or (current_start_index is not None and gcode[current_start_index] != "; CP TOOLCHANGE START") or gcode[end_index] != "; CP TOOLCHANGE END":
+                raise ValueError(f"Toolchange at line {idx} does not have the marker comments. current_start_index: {current_start_index}, end_index: {end_index}")
+
+            yield ToolChange(current_layer, current_filament, next_filament, idx, current_start_index, end_index)
 
             current_filament = next_filament
 
@@ -368,6 +380,9 @@ class ToolChange:
 class ManualToolChange:
     toolchange: ToolChange
     ams: list[Filament]
+
+    def starts_at(self, idx: int) -> bool:
+        return self.toolchange.start_index == idx
 
 class GCode:
     file_path: Path
@@ -503,14 +518,10 @@ class GCode:
                 continue
 
             # This inserts the special filament change gcode for the problematic tool changes.
-            if manual_toolchange is not None and manual_toolchange.toolchange.is_conflict(filament_grouping) and line.startswith("; CP TOOLCHANGE START"):
-                end = next((idx for idx, line in enumerate(self.gcode[idx:], start=idx) if line.startswith("; CP TOOLCHANGE END")), None)
-                if end is None or not self.gcode[end].startswith("; CP TOOLCHANGE END"):
-                    raise ValueError("Could not find the end of the tool change gcode.")
-
-                data.extend(paused_filament_change(self.gcode[idx:end + 1]))
+            if manual_toolchange is not None and manual_toolchange.toolchange.is_conflict(filament_grouping) and manual_toolchange.starts_at(idx):
+                data.extend(paused_filament_change(self.gcode[idx:manual_toolchange.toolchange.end_index + 1]))
                 # ensure that all lines are skipped until the end of the tool change gcode (to prevent double insertions)
-                skip_until = end
+                skip_until = manual_toolchange.toolchange.end_index
 
                 self.inform_user(manual_toolchange, filament_grouping, output)
                 manual_toolchange = next(iter_manual_toolchanges, None)
