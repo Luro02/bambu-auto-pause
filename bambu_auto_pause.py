@@ -426,13 +426,22 @@ class GCode:
     
 
     def find_first_full_ams(self, filament_grouping: FilamentGrouping) -> list[Filament]:
+        result_ams = []
         last_ams = []
+        i = 0
         for toolchange in self.iter_manual_toolchanges(filament_grouping):
             last_ams = toolchange.ams
-            if len(last_ams) == self.ams_size:
-                return last_ams
+            if len(last_ams) > i:
+                i = len(last_ams)
+                # assuming last_ams = [5, 2, 3]
+                # and result_ams = [1]
+                # then result_ams should be appended with [2, 3]
+                result_ams.extend(last_ams[len(result_ams):])
 
-        return last_ams
+            if len(result_ams) == self.ams_size:
+                return result_ams
+
+        return result_ams
 
 
     def iter_manual_toolchanges(self, filament_grouping: FilamentGrouping) -> Iterator[ManualToolChange]:
