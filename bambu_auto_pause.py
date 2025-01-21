@@ -398,11 +398,21 @@ class GCode:
         self,
         file_path: Path,
         filament_changes_file: Path,
-        plate: int = 1,
+        plate: int | None = None,
         ams_size: int = 4,
         line_separator: str = '\n',
     ) -> None:
         with ZipFile(file_path, 'r') as zf:
+            if plate is None:
+                for name in zf.namelist():
+                    match = re.match(r'Metadata/plate_(\d+)\.gcode', name)
+                    if match:
+                        plate = int(match.group(1))
+                        break
+
+            if plate is None:
+                raise ValueError("Could not find a plate in the 3mf file.")
+
             with zf.open(f'Metadata/plate_{plate}.gcode') as f:
                 data = f.read().decode('utf-8')
                 line_separator = '\n'
