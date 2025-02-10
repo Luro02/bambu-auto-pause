@@ -13,6 +13,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from zipfile import ZipFile, ZIP_STORED, ZipInfo
 
+def log(*objects, **kwargs):
+    print(*objects, **kwargs)
+    with open('log.txt', 'a', encoding='utf-8') as fd:
+        print(*objects, **kwargs, file=fd)
+
 # This class is taken from https://stackoverflow.com/a/35435548/7766117
 class UpdateableZipFile(ZipFile):
     """
@@ -519,7 +524,7 @@ class GCode:
 
         message = f"Manual filament change required in layer {current_toolchange.layer}: Swap color {color_to_swap_with} with {current_toolchange.next_filament}: {current_state}"
         output.append(message)
-        print(message)
+        log(message)
 
     def write(self, modified_file: Path, filament_grouping: FilamentGrouping, log_file: Path) -> None:
         # prepare the modified file:
@@ -557,13 +562,13 @@ class GCode:
             self.inform_user(manual_toolchange, filament_grouping, output)
             manual_toolchange = next(iter_manual_toolchanges, None)
 
-        print()
+        log()
         output.append("")
         message = f"Filament change times: {len(self.toolchanges) - 1}"
-        print(message)
+        log(message)
         output.append(message)
         message = f"Manual filament change times: {len(manual_toolchanges)}"
-        print(message)
+        log(message)
         output.append(message)
 
         with open(log_file, 'w') as fd:
@@ -579,13 +584,13 @@ class GCode:
             zf.writestr(f'Metadata/plate_{self.plate}.gcode.md5', hashlib.md5(encoded_data).hexdigest().upper())
 
 if len(sys.argv) < 2:
-    print(f"Usage: {sys.argv[0]} <3mf gcode file> color:slot [color:slot ...]")
-    print(f"For example: {sys.argv[0]} cube.gcode.3mf 5:2 7:3")
+    log(f"Usage: {sys.argv[0]} <3mf gcode file> color:slot [color:slot ...]")
+    log(f"For example: {sys.argv[0]} cube.gcode.3mf 5:2 7:3")
     sys.exit(1)
 
 input_file = Path(sys.argv[1])
 if not input_file.exists():
-    print(f"Error: File {input_file} does not exist.")
+    log(f"Error: File {input_file} does not exist.")
     sys.exit(1)
 
 grouped_filaments = []
@@ -594,33 +599,33 @@ for arg in sys.argv[2:]:
 
 gcode = GCode(input_file, input_file.with_name(f"filament_changes.txt"))
 if len(grouped_filaments) == 0:
-    print("Warning: No color remapping specified. Will now compute the color remapping with the least amount of manual tool changes.")
+    log("Warning: No color remapping specified. Will now compute the color remapping with the least amount of manual tool changes.")
     mapping = gcode.find_best_mapping(2)
     if mapping is None:
-        print("Error: Could not find a mapping.")
+        log("Error: Could not find a mapping.")
         sys.exit(1)
     
     (grouped_filaments, manual_toolchanges, total_toolchanges) = mapping
-    print("")
-    print(f"Filament change times: {total_toolchanges - 1}")
-    print(f"Manual filament change times: {manual_toolchanges}")
+    log("")
+    log(f"Filament change times: {total_toolchanges - 1}")
+    log(f"Manual filament change times: {manual_toolchanges}")
 
-    print(f"The best color remapping should be: {grouped_filaments}")
+    log(f"The best color remapping should be: {grouped_filaments}")
 else:
     all_filaments = gcode.all_filaments()
     grouped_filaments = FilamentGrouping.from_list(grouped_filaments, {f.id:f for f in all_filaments})
 
 states = list(gcode.iter_manual_toolchanges(grouped_filaments))
 if len(states) == 0:
-    print("No manual tool changes are required.")
+    log("No manual tool changes are required.")
     sys.exit(0)
 
-print(f"The program assumes that the AMS is loaded initially with the colors: {gcode.find_first_full_ams(grouped_filaments)}")
-print(f"The following filaments are grouped together: {grouped_filaments}")
+log(f"The program assumes that the AMS is loaded initially with the colors: {gcode.find_first_full_ams(grouped_filaments)}")
+log(f"The following filaments are grouped together: {grouped_filaments}")
 
 toolchange_conflicts = gcode.list_conflicts(grouped_filaments, states.__iter__())
 if len(toolchange_conflicts) > 0:
-    print(f"The print order has to be changed in the slicer, so that the following colors are not printed after each other:")
+    log(f"The print order has to be changed in the slicer, so that the following colors are not printed after each other:")
 
 first_layer = None
 last_layer = None
@@ -642,24 +647,24 @@ for (layer, tcs) in toolchange_conflicts.items():
         last_layer = layer
         continue
 
-    print(f"Layer {first_layer} to {last_layer}: {[f'{a} -> {b}' for (a, b) in set(conflicts)]}")
+    log(f"Layer {first_layer} to {last_layer}: {[f'{a} -> {b}' for (a, b) in set(conflicts)]}")
     first_layer = layer
     last_layer = layer + 1
     conflicts = list(v)
 
 if len(conflicts) > 0:
-    print(f"Layer {first_layer} to {last_layer}: {[f'{a} -> {b}' for (a, b) in set(conflicts)]}")
+    log(f"Layer {first_layer} to {last_layer}: {[f'{a} -> {b}' for (a, b) in set(conflicts)]}")
 
 if len(toolchange_conflicts) > 0:
-    print("")
-    print("There are conflicts with the current filament printing order.")
-    print("You can change the filament order for these layers in the slicer and re-run the script.")
-    print("")
-    print("This script will now generate a special gcode file where it resolves these conflicts through a special filament change gcode.")
-    print("Therefore you don't have to change the filament order in the slicer.")
-    print("")
-    print("Warning: This script has only been tested on a P1S, it might break stuff on other printers like the A1 or A1 mini!")
-    print("         If you don't want to risk it, change the print order in the slicer.")
+    log("")
+    log("There are conflicts with the current filament printing order.")
+    log("You can change the filament order for these layers in the slicer and re-run the script.")
+    log("")
+    log("This script will now generate a special gcode file where it resolves these conflicts through a special filament change gcode.")
+    log("Therefore you don't have to change the filament order in the slicer.")
+    log("")
+    log("Warning: This script has only been tested on a P1S, it might break stuff on other printers like the A1 or A1 mini!")
+    log("         If you don't want to risk it, change the print order in the slicer.")
     # sys.exit(1)
 
 gcode.write(
