@@ -344,7 +344,7 @@ class ToolChange:
             # - T255
             # These will be ignored by the script.
             match = re.match(r'T(\d+)', line)
-            if not match or match.group(1) in ['1000', '255']:
+            if not match or match.group(1) in ['1000', '1100', '255']:
                 continue
 
             next_filament_id = int(match.group(1))
