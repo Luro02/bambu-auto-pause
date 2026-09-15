@@ -323,6 +323,13 @@ class ToolChange:
         for idx, line in enumerate(gcode):
             if line.startswith("; CP TOOLCHANGE START"):
                 current_start_index = idx
+            else:
+                # Newer Bambu Studio / P2S G-code no longer emits the
+                # CP TOOLCHANGE marker comments. M620 S<n>A marks the
+                # beginning of a filament change instead.
+                start_match = re.match(r"\s*M620 S(\d+)A", line)
+                if start_match:
+                    current_start_index = idx
 
             # This gcode is used to indicate the start of a new layer.
             # It is kept track of to provide context for where tool changes
@@ -344,16 +351,37 @@ class ToolChange:
             # - T255
             # These will be ignored by the script.
             match = re.match(r'T(\d+)', line)
-            if not match or match.group(1) in ['1000', '1100', '255']:
+            if not match or match.group(1) in ['1000', '1100', '255', '65535']:
                 continue
 
             next_filament_id = int(match.group(1))
             next_filament = Filament(next_filament_id, colors[next_filament_id])
 
-            end_index = next((idx for idx, line in enumerate(gcode[idx:], start=idx) if line.startswith("; CP TOOLCHANGE END")), None)
+            # Old Bambu Studio versions wrapped a toolchange in CP TOOLCHANGE
+            # comments. Newer P2S G-code uses M620 S<n>A ... M621 S<n>A.
+            end_index = next((
+                i for i, candidate in enumerate(gcode[idx:], start=idx)
+                if candidate.startswith("; CP TOOLCHANGE END")
+                   or re.match(rf"\s*M621 S{next_filament_id}A", candidate)
+            ), None)
 
-            if end_index is None or (current_start_index is not None and gcode[current_start_index] != "; CP TOOLCHANGE START") or gcode[end_index] != "; CP TOOLCHANGE END":
-                raise ValueError(f"Toolchange at line {idx} does not have the marker comments. current_start_index: {current_start_index}, end_index: {end_index}")
+            old_markers = (
+                    current_start_index is not None
+                    and gcode[current_start_index] == "; CP TOOLCHANGE START"
+                    and end_index is not None
+                    and gcode[end_index] == "; CP TOOLCHANGE END"
+            )
+            new_markers = (
+                    current_start_index is not None
+                    and re.match(rf"\s*M620 S{next_filament_id}A", gcode[current_start_index])
+                    and end_index is not None
+                    and re.match(rf"\s*M621 S{next_filament_id}A", gcode[end_index])
+            )
+            if not old_markers and not new_markers:
+                raise ValueError(
+                    f"Toolchange at line {idx} does not have recognizable boundaries. "
+                    f"current_start_index: {current_start_index}, end_index: {end_index}"
+                )
 
             yield ToolChange(current_layer, current_filament, next_filament, idx, current_start_index, end_index)
 
